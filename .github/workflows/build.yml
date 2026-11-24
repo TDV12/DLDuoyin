@@ -1,7 +1,12 @@
-name: Build Douyin Downloader V4 VN
+name: Build Douyin Instagram V5 VN
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Commit QingZai from V4 UPSTREAM-COMMIT.txt (optional)"
+        required: false
+        default: "main"
   push:
     branches: [main]
     paths: ['.github/workflows/build.yml']
@@ -18,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Yukioooooo0/QingZai
-          ref: main
+          ref: ${{ inputs.upstream_ref || 'main' }}
           path: qingzai
           persist-credentials: false
 
@@ -61,7 +66,7 @@ jobs:
           base = Path('app/src/main')
           ui = base / 'java/com/douyin/downloader/ui'
           labels = {
-              '轻载': 'Douyin Downloader VN',
+              '轻载': 'Douyin + Instagram VN',
               '粘贴视频或图片链接...': 'Dán liên kết video hoặc ảnh...',
               '清除': 'Xóa', '解析': 'Phân tích',
               '输入链接以获取媒体内容': 'Nhập liên kết để lấy nội dung',
@@ -97,16 +102,294 @@ jobs:
           manifest = base / 'AndroidManifest.xml'
           text = manifest.read_text(encoding='utf-8')
           manifest.write_text(text.replace('android:label="轻载"',
-              'android:label="Douyin Downloader VN"'), encoding='utf-8')
+              'android:label="Douyin + Instagram VN"'), encoding='utf-8')
           # Install beside previous builds, without changing Kotlin package names.
           build = Path('app/build.gradle.kts')
           text = build.read_text(encoding='utf-8')
           old = 'applicationId = "com.douyin.downloader"'
           if old not in text:
               raise SystemExit('Upstream applicationId changed; review before building.')
-          build.write_text(text.replace(old, 'applicationId = "com.douyin.downloader.vn"', 1), encoding='utf-8')
+          build.write_text(text.replace(old, 'applicationId = "com.douyin.downloader.vn.v5"', 1), encoding='utf-8')
           print(f'Localized {total} UI string occurrences.')
           PY
+
+      - name: Add Instagram photo downloader and run parser tests
+        working-directory: qingzai
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          base = Path('app/src/main')
+          manifest = base / 'AndroidManifest.xml'
+          text = manifest.read_text(encoding='utf-8')
+          if text.count('</application>') != 1:
+              raise SystemExit('Cannot locate application manifest block')
+          text = text.replace('</application>', '<activity android:name="com.douyin.downloader.InstagramImageActivity" android:exported="false" />\n    </application>')
+          manifest.write_text(text, encoding='utf-8')
+          home = base / 'java/com/douyin/downloader/ui/home/HomeScreen.kt'
+          text = home.read_text(encoding='utf-8')
+          marker = 'val state by viewModel.uiState.collectAsState()'
+          if text.count(marker) != 1 or text.count('// Input') != 1:
+              raise SystemExit('HomeScreen changed: review V5 patch')
+          text = text.replace(marker, marker + '\n    val instagramContext = androidx.compose.ui.platform.LocalContext.current', 1)
+          button = 'Button(\n    onClick = {\n        val intent = android.content.Intent(instagramContext, com.douyin.downloader.InstagramImageActivity::class.java)\n        intent.putExtra("image_input", state.inputUrl)\n        instagramContext.startActivity(intent)\n    },\n    modifier = Modifier.fillMaxWidth()\n) { Text("Tải ảnh Instagram") }\nSpacer(modifier = Modifier.height(8.dp))\n'
+          text = text.replace('// Input', button + '\n            // Input', 1)
+          home.write_text(text, encoding='utf-8')
+          PY
+          cat > app/src/main/java/com/douyin/downloader/InstagramImageActivity.java <<'JAVA'
+          package com.douyin.downloader;
+          
+          import android.app.Activity;
+          import android.content.*;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.MediaStore;
+          import android.view.ViewGroup;
+          import android.widget.*;
+          import java.io.*;
+          import java.net.*;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Locale;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          
+          public final class InstagramImageActivity extends Activity {
+              private final ExecutorService executor = Executors.newSingleThreadExecutor();
+              private EditText input;
+              private TextView status;
+              private ImageView preview;
+              private Button analyze, save, paste;
+              private CheckBox permission;
+              private byte[] image;
+              private String mime, filename;
+              private static final int PICK_FILE = 51;
+              private static final int MAX_IMAGE = 20 * 1024 * 1024;
+              private static final int MAX_HTML = 4 * 1024 * 1024;
+              private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setClipToPadding(false);
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(dp(20), dp(28), dp(20), dp(24));
+                  scroll.addView(layout);
+                  setContentView(scroll);
+                  TextView title = new TextView(this);
+                  title.setText("Tải ảnh Instagram"); title.setTextSize(24); layout.addView(title);
+                  TextView hint = new TextView(this);
+                  hint.setText("Dán liên kết bài viết công khai hoặc URL ảnh trực tiếp. Chỉ lưu ảnh bạn có quyền sử dụng.");
+                  layout.addView(hint);
+                  input = new EditText(this); input.setHint("https://www.instagram.com/p/...");
+                  input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+                  input.setMaxLines(4); layout.addView(input);
+                  String shared = getIntent().getStringExtra("image_input");
+                  if (shared != null) input.setText(shared);
+                  paste = new Button(this); paste.setText("Dán liên kết"); layout.addView(paste);
+                  paste.setOnClickListener(v -> {
+                      ClipboardManager cb = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                      if (cb != null && cb.hasPrimaryClip()) {
+                          ClipData data = cb.getPrimaryClip();
+                          if (data != null && data.getItemCount() > 0) input.setText(data.getItemAt(0).coerceToText(this));
+                      }
+                  });
+                  analyze = new Button(this); analyze.setText("Phân tích / xem ảnh"); layout.addView(analyze);
+                  permission = new CheckBox(this); permission.setText("Tôi có quyền lưu ảnh này"); layout.addView(permission);
+                  preview = new ImageView(this); preview.setAdjustViewBounds(true); preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  layout.addView(preview, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+                  status = new TextView(this); status.setText("Chưa có ảnh. Không hỗ trợ bài riêng tư hoặc yêu cầu đăng nhập."); layout.addView(status);
+                  save = new Button(this); save.setText("Lưu ảnh vào điện thoại"); save.setEnabled(false); layout.addView(save);
+                  Button back = new Button(this); back.setText("Quay lại Douyin"); layout.addView(back); back.setOnClickListener(v -> finish());
+                  permission.setOnCheckedChangeListener((v, checked) -> save.setEnabled(checked && image != null && analyze.isEnabled()));
+                  analyze.setOnClickListener(v -> loadImage());
+                  save.setOnClickListener(v -> saveImage());
+              }
+              private void busy(boolean value) { analyze.setEnabled(!value); paste.setEnabled(!value); input.setEnabled(!value); save.setEnabled(!value && permission.isChecked() && image != null); }
+              private void loadImage() {
+                  String text = input.getText().toString();
+                  image = null; mime = null; filename = null; preview.setImageDrawable(null); permission.setChecked(false);
+                  busy(true); status.setText("Đang kiểm tra nguồn ảnh công khai...");
+                  executor.execute(() -> {
+                      try {
+                          URI url = InstagramPublicImage.extract(text);
+                          boolean post = InstagramPublicImage.isPost(url);
+                          if (post) {
+                              Data page = fetch(url, MAX_HTML, true);
+                              if (!page.mime.equals("text/html") && !page.mime.equals("application/xhtml+xml")) throw new IOException("Trang không trả về HTML.");
+                              url = InstagramPublicImage.previewUrl(new String(page.bytes, StandardCharsets.UTF_8));
+                              if (url == null) throw new IOException("Không tìm thấy ảnh xem trước công khai. Có thể Instagram yêu cầu đăng nhập hoặc không cung cấp ảnh.");
+                          }
+                          Data result = fetch(url, MAX_IMAGE, false);
+                          String ext;
+                          switch(result.mime) {
+                              case "image/jpeg": ext = "jpg"; break;
+                              case "image/png": ext = "png"; break;
+                              case "image/webp": ext = "webp"; break;
+                              case "image/gif": ext = "gif"; break;
+                              default: throw new IOException("Nguồn không trả về tệp ảnh được hỗ trợ.");
+                          }
+                          BitmapFactory.Options dimensions = new BitmapFactory.Options(); dimensions.inJustDecodeBounds = true;
+                          BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.length, dimensions);
+                          if (dimensions.outWidth <= 0 || dimensions.outHeight <= 0) throw new IOException("Tệp ảnh không hợp lệ.");
+                          BitmapFactory.Options options = new BitmapFactory.Options(); options.inSampleSize = 1;
+                          while (Math.max(dimensions.outWidth, dimensions.outHeight) / options.inSampleSize > 1800) options.inSampleSize *= 2;
+                          Bitmap bitmap = BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.length, options);
+                          if (bitmap == null) throw new IOException("Không đọc được ảnh.");
+                          runOnUiThread(() -> {
+                              if (isFinishing() || isDestroyed()) { bitmap.recycle(); return; }
+                              image = result.bytes; mime = result.mime; filename = "Instagram_" + System.currentTimeMillis() + "." + ext;
+                              preview.setImageBitmap(bitmap);
+                              status.setText((post ? "Ảnh xem trước công khai (có thể không phải ảnh gốc)" : "Ảnh trực tiếp") + " · " + dimensions.outWidth + " × " + dimensions.outHeight);
+                              busy(false);
+                          });
+                      } catch (Exception ex) { showError(ex); }
+                  });
+              }
+              private void showError(Exception ex) {
+                  runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) { status.setText("Không thành công: " + (ex.getMessage() == null ? "Lỗi kết nối hoặc dữ liệu" : ex.getMessage())); busy(false); } });
+              }
+              private static class Data {
+                  final byte[] bytes; final String mime;
+                  Data(byte[] bytes, String mime) { this.bytes = bytes; this.mime = mime; }
+              }
+              private static Data fetch(URI uri, int limit, boolean page) throws Exception {
+                  for (int i = 0; i < 5; i++) {
+                      if (!(page ? InstagramPublicImage.isPost(uri) : InstagramPublicImage.isImageHost(uri))) throw new IOException("Địa chỉ ngoài phạm vi được hỗ trợ hoặc trang yêu cầu đăng nhập.");
+                      HttpURLConnection connection = (HttpURLConnection)uri.toURL().openConnection();
+                      try {
+                          connection.setInstanceFollowRedirects(false); connection.setConnectTimeout(15000); connection.setReadTimeout(20000);
+                          connection.setRequestProperty("Accept", page ? "text/html,application/xhtml+xml" : "image/*");
+                          connection.setRequestProperty("User-Agent", "InstagramImageViewer/1.0");
+                          int code = connection.getResponseCode();
+                          if (code >= 300 && code < 400) {
+                              String location = connection.getHeaderField("Location");
+                              if (location == null) throw new IOException("Chuyển hướng không hợp lệ.");
+                              uri = uri.resolve(location); continue;
+                          }
+                          if (code != 200) throw new IOException("Instagram trả về HTTP " + code + ". Không thử vượt giới hạn truy cập.");
+                          String type = connection.getContentType();
+                          type = type == null ? "" : type.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+                          if (page ? !(type.equals("text/html") || type.equals("application/xhtml+xml")) : !type.startsWith("image/")) throw new IOException("Máy chủ không cung cấp nội dung phù hợp.");
+                          if (connection.getContentLengthLong() > limit) throw new IOException("Tệp vượt giới hạn dung lượng.");
+                          try (InputStream in = connection.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                              byte[] buf = new byte[8192]; int n;
+                              while ((n = in.read(buf)) != -1) { if (out.size() + n > limit) throw new IOException("Tệp vượt giới hạn dung lượng."); out.write(buf, 0, n); }
+                              return new Data(out.toByteArray(), type);
+                          }
+                      } finally { connection.disconnect(); }
+                  }
+                  throw new IOException("Quá nhiều chuyển hướng.");
+              }
+              private void saveImage() {
+                  if (image == null || !permission.isChecked()) return;
+                  if (Build.VERSION.SDK_INT < 29) {
+                      Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType(mime).addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE, filename);
+                      startActivityForResult(intent, PICK_FILE); return;
+                  }
+                  final byte[] data = image; final String type = mime, name = filename;
+                  busy(true);
+                  executor.execute(() -> {
+                      Uri uri = null;
+                      try {
+                          ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.DISPLAY_NAME, name); values.put(MediaStore.Images.Media.MIME_TYPE, type);
+                          values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DouyinInstagram"); values.put(MediaStore.Images.Media.IS_PENDING, 1);
+                          uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                          if (uri == null) throw new IOException("Không tạo được tệp.");
+                          write(uri, data);
+                          values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0); getContentResolver().update(uri, values, null, null);
+                          runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) { status.setText("Đã lưu: Pictures/DouyinInstagram/" + name); busy(false); } });
+                      } catch (Exception ex) { if (uri != null) try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {} showError(ex); }
+                  });
+              }
+              private void write(Uri uri, byte[] data) throws IOException {
+                  try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) { if (out == null) throw new IOException("Không mở được tệp."); out.write(data); }
+              }
+              @Override protected void onActivityResult(int request, int result, Intent data) {
+                  super.onActivityResult(request, result, data);
+                  if (request != PICK_FILE || result != RESULT_OK || data == null || data.getData() == null || image == null || !permission.isChecked()) return;
+                  final Uri uri = data.getData(); final byte[] bytes = image; busy(true);
+                  executor.execute(() -> { try { write(uri, bytes); runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) { status.setText("Đã lưu ảnh."); busy(false); } }); } catch (Exception ex) { showError(ex); } });
+              }
+              @Override protected void onDestroy() { executor.shutdownNow(); super.onDestroy(); }
+          }
+          JAVA
+          cat > app/src/main/java/com/douyin/downloader/InstagramPublicImage.java <<'JAVA'
+          package com.douyin.downloader;
+          
+          import java.net.URI;
+          import java.util.Locale;
+          import java.util.regex.*;
+          import java.util.HashMap;
+          
+          final class InstagramPublicImage {
+              private static final Pattern LINK = Pattern.compile("https://[^\\s<>\\\"\\[\\]（）]+", Pattern.CASE_INSENSITIVE);
+              private static final Pattern META = Pattern.compile("<meta\\b[^>]*>", Pattern.CASE_INSENSITIVE);
+              private static final Pattern ATTR = Pattern.compile("([a-zA-Z_:][-a-zA-Z0-9_:.]*)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))");
+              private static boolean secure(URI u) { return u != null && "https".equalsIgnoreCase(u.getScheme()) && u.getHost() != null && u.getRawUserInfo() == null && (u.getPort() == -1 || u.getPort() == 443); }
+              static boolean isPost(URI u) {
+                  if (!secure(u)) return false;
+                  String h = u.getHost().toLowerCase(Locale.ROOT);
+                  return (h.equals("www.instagram.com") || h.equals("instagram.com")) && u.getPath().matches("/p/[A-Za-z0-9_-]+/?");
+              }
+              static boolean isImageHost(URI u) {
+                  if (!secure(u)) return false;
+                  String h = u.getHost().toLowerCase(Locale.ROOT);
+                  return h.endsWith(".cdninstagram.com") || h.endsWith(".fbcdn.net");
+              }
+              static URI extract(String text) {
+                  Matcher m = LINK.matcher(text);
+                  while (m.find()) {
+                      try {
+                          URI uri = URI.create(m.group().replaceAll("[).,;!?]+$", ""));
+                          if (isPost(uri)) return URI.create("https://www.instagram.com" + uri.getPath());
+                          if (isImageHost(uri)) return uri;
+                      } catch (IllegalArgumentException ignored) {}
+                  }
+                  throw new IllegalArgumentException("Cần link bài viết /p/ hoặc URL ảnh Instagram trực tiếp (HTTPS).");
+              }
+              static URI previewUrl(String html) {
+                  Matcher tags = META.matcher(html);
+                  while (tags.find()) {
+                      HashMap<String, String> attributes = new HashMap<>(); Matcher a = ATTR.matcher(tags.group());
+                      while (a.find()) attributes.put(a.group(1).toLowerCase(Locale.ROOT), a.group(2) != null ? a.group(2) : a.group(3) != null ? a.group(3) : a.group(4));
+                      String property = attributes.get("property"); if (property == null) property = attributes.get("name");
+                      if (!("og:image".equalsIgnoreCase(property) || "og:image:secure_url".equalsIgnoreCase(property))) continue;
+                      String content = attributes.get("content"); if (content == null) continue;
+                      try { URI uri = URI.create(content.replace("&amp;", "&").replace("&#38;", "&").replace("&#x26;", "&")); if (isImageHost(uri)) return uri; } catch (IllegalArgumentException ignored) {}
+                  }
+                  return null;
+              }
+          }
+          JAVA
+          mkdir -p /tmp/instagram-v5-test
+          cat > /tmp/instagram-v5-test/TestPublicImage.java <<'JAVA'
+          package com.douyin.downloader;
+          import java.net.URI;
+          class TestPublicImage {
+              static int count;
+              static void check(boolean b) { if (!b) throw new AssertionError("Case " + (count+1)); count++; }
+              public static void main(String[] args) {
+                  check(InstagramPublicImage.extract("Ảnh https://instagram.com/p/Abc_1/?igsh=abc").toString().equals("https://www.instagram.com/p/Abc_1/"));
+                  check(InstagramPublicImage.isImageHost(URI.create("https://scontent.cdninstagram.com/file.jpg?a=b")));
+                  check(!InstagramPublicImage.isPost(URI.create("https://instagram.com.evil.com/p/a/")));
+                  check(!InstagramPublicImage.isPost(URI.create("https://www.instagram.com/accounts/login/")));
+                  check(!InstagramPublicImage.isImageHost(URI.create("https://scontent.cdninstagram.com.evil.com/file.jpg")));
+                  check(!InstagramPublicImage.isImageHost(URI.create("http://scontent.cdninstagram.com/file.jpg")));
+                  check(!InstagramPublicImage.isImageHost(URI.create("https://u@scontent.cdninstagram.com/file.jpg")));
+                  check(InstagramPublicImage.previewUrl("<meta content='https://scontent.cdninstagram.com/a.jpg?x=1&amp;y=2' property='og:image'>").toString().endsWith("?x=1&y=2"));
+                  check(InstagramPublicImage.previewUrl("<meta property='og:image' content='https://evil.example/a.jpg'>") == null);
+                  check(InstagramPublicImage.previewUrl("<meta property='og:title' content='foo'>") == null);
+                  System.out.println(count + " tests passed");
+              }
+          }
+          JAVA
+          javac -d /tmp/instagram-v5-test app/src/main/java/com/douyin/downloader/InstagramPublicImage.java /tmp/instagram-v5-test/TestPublicImage.java
+          java -cp /tmp/instagram-v5-test com.douyin.downloader.TestPublicImage
 
       - name: Build APK
         working-directory: qingzai
@@ -117,14 +400,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp qingzai/app/build/outputs/apk/debug/app-debug.apk dist/DouyinDownloader-V4-VN.apk
+          cp qingzai/app/build/outputs/apk/debug/app-debug.apk dist/DouyinInstagram-V5-VN.apk
           cp qingzai/LICENSE dist/LICENSE-QingZai.txt
           git -C qingzai rev-parse HEAD > dist/UPSTREAM-COMMIT.txt
-          sha256sum dist/DouyinDownloader-V4-VN.apk > dist/SHA256.txt
+          sha256sum dist/DouyinInstagram-V5-VN.apk > dist/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DouyinDownloader-V4-VN
+          name: DouyinInstagram-V5-VN
           path: dist/
           if-no-files-found: error
