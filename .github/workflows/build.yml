@@ -1,0 +1,130 @@
+name: Build Douyin Downloader V4 VN
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Get QingZai upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: Yukioooooo0/QingZai
+          ref: main
+          path: qingzai
+          persist-credentials: false
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          test -d "$sdk"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          missing=()
+          for pkg in 'platforms;android-35' 'build-tools;34.0.0' 'build-tools;35.0.0'; do
+            if [[ ! -d "$sdk/${pkg/;/\/}" ]]; then missing+=("$pkg"); fi
+          done
+          if (( ${#missing[@]} )); then
+            manager=$(find "$sdk/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)
+            test -n "$manager"
+            yes | "$manager" --sdk_root="$sdk" --licenses >/dev/null || true
+            "$manager" --sdk_root="$sdk" "${missing[@]}"
+          fi
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Apply Vietnamese interface labels
+        working-directory: qingzai
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path('app/src/main')
+          ui = base / 'java/com/douyin/downloader/ui'
+          labels = {
+              '轻载': 'Douyin Downloader VN',
+              '粘贴视频或图片链接...': 'Dán liên kết video hoặc ảnh...',
+              '清除': 'Xóa', '解析': 'Phân tích',
+              '输入链接以获取媒体内容': 'Nhập liên kết để lấy nội dung',
+              '正在解析链接，请稍候...': 'Đang phân tích liên kết...',
+              '无标题': 'Không có tiêu đề', '下载视频': 'Tải video',
+              '下载视频（含音乐）': 'Tải video (kèm nhạc)',
+              '解析结果': 'Kết quả phân tích', '取消全选': 'Bỏ chọn tất cả',
+              '全选': 'Chọn tất cả', '下载': 'Tải xuống', '历史': 'Lịch sử',
+              '下载中心': 'Trung tâm tải xuống', '清空记录': 'Xóa nhật ký',
+              '暂无下载任务': 'Chưa có tác vụ tải', '下载中...': 'Đang tải...',
+              '等待中': 'Đang chờ', '已完成': 'Đã hoàn tất', '刚刚': 'Vừa xong',
+              '历史记录': 'Lịch sử', '清空历史': 'Xóa lịch sử',
+              '暂无历史记录': 'Chưa có lịch sử', '视频': 'Video',
+              '图文': 'Ảnh và văn bản', '动图': 'Ảnh động',
+              '下载所选 (${state.selectedImages.size})': 'Tải mục đã chọn (${state.selectedImages.size})',
+              '${minutes}分钟前': '${minutes} phút trước',
+              '${hours}小时前': '${hours} giờ trước',
+              '${days}天前': '${days} ngày trước',
+          }
+          files = ['home/HomeScreen.kt', 'navigation/AppNavigation.kt',
+                   'downloads/DownloadsScreen.kt', 'history/HistoryScreen.kt']
+          total = 0
+          for name in files:
+              path = ui / name
+              content = path.read_text(encoding='utf-8')
+              for old, new in labels.items():
+                  before, after = '"' + old + '"', '"' + new + '"'
+                  total += content.count(before)
+                  content = content.replace(before, after)
+              path.write_text(content, encoding='utf-8')
+          if total == 0:
+              raise SystemExit('Upstream UI changed; review the translation mapping.')
+          manifest = base / 'AndroidManifest.xml'
+          text = manifest.read_text(encoding='utf-8')
+          manifest.write_text(text.replace('android:label="轻载"',
+              'android:label="Douyin Downloader VN"'), encoding='utf-8')
+          # Install beside previous builds, without changing Kotlin package names.
+          build = Path('app/build.gradle.kts')
+          text = build.read_text(encoding='utf-8')
+          old = 'applicationId = "com.douyin.downloader"'
+          if old not in text:
+              raise SystemExit('Upstream applicationId changed; review before building.')
+          build.write_text(text.replace(old, 'applicationId = "com.douyin.downloader.vn"', 1), encoding='utf-8')
+          print(f'Localized {total} UI string occurrences.')
+          PY
+
+      - name: Build APK
+        working-directory: qingzai
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Prepare APK and license
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp qingzai/app/build/outputs/apk/debug/app-debug.apk dist/DouyinDownloader-V4-VN.apk
+          cp qingzai/LICENSE dist/LICENSE-QingZai.txt
+          git -C qingzai rev-parse HEAD > dist/UPSTREAM-COMMIT.txt
+          sha256sum dist/DouyinDownloader-V4-VN.apk > dist/SHA256.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouyinDownloader-V4-VN
+          path: dist/
+          if-no-files-found: error
