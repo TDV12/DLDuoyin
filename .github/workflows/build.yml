@@ -1,4 +1,4 @@
-name: Build Douyin Instagram V5 VN
+name: Build Douyin Instagram V5.1 VN
 
 on:
   workflow_dispatch:
@@ -109,11 +109,11 @@ jobs:
           old = 'applicationId = "com.douyin.downloader"'
           if old not in text:
               raise SystemExit('Upstream applicationId changed; review before building.')
-          build.write_text(text.replace(old, 'applicationId = "com.douyin.downloader.vn.v5"', 1), encoding='utf-8')
+          build.write_text(text.replace(old, 'applicationId = "com.douyin.downloader.vn.v51"', 1), encoding='utf-8')
           print(f'Localized {total} UI string occurrences.')
           PY
 
-      - name: Add Instagram photo downloader and run parser tests
+      - name: Add Instagram album downloader and run parser tests
         working-directory: qingzai
         shell: bash
         run: |
@@ -154,7 +154,7 @@ jobs:
           import java.io.*;
           import java.net.*;
           import java.nio.charset.StandardCharsets;
-          import java.util.Locale;
+          import java.util.*;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
           
@@ -163,13 +163,18 @@ jobs:
               private EditText input;
               private TextView status;
               private ImageView preview;
-              private Button analyze, save, paste;
+              private Button analyze, save, paste, prev, next, all;
+              private TextView position;
+              private List<InstagramAlbum.Photo> photos = Collections.emptyList();
+              private int index;
+              private boolean previewOnly;
+              private String albumSummary = "";
               private CheckBox permission;
               private byte[] image;
               private String mime, filename;
               private static final int PICK_FILE = 51;
               private static final int MAX_IMAGE = 20 * 1024 * 1024;
-              private static final int MAX_HTML = 4 * 1024 * 1024;
+              private static final int MAX_HTML = 12 * 1024 * 1024;
               private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
               @Override public void onCreate(Bundle state) {
                   super.onCreate(state);
@@ -183,7 +188,7 @@ jobs:
                   TextView title = new TextView(this);
                   title.setText("Tải ảnh Instagram"); title.setTextSize(24); layout.addView(title);
                   TextView hint = new TextView(this);
-                  hint.setText("Dán liên kết bài viết công khai hoặc URL ảnh trực tiếp. Chỉ lưu ảnh bạn có quyền sử dụng.");
+                  hint.setText("Dán liên kết bài viết công khai. App chọn ảnh có độ phân giải cao nhất được cung cấp, không bảo đảm là tệp gốc. Chỉ lưu ảnh bạn có quyền sử dụng.");
                   layout.addView(hint);
                   input = new EditText(this); input.setHint("https://www.instagram.com/p/...");
                   input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
@@ -199,56 +204,122 @@ jobs:
                       }
                   });
                   analyze = new Button(this); analyze.setText("Phân tích / xem ảnh"); layout.addView(analyze);
-                  permission = new CheckBox(this); permission.setText("Tôi có quyền lưu ảnh này"); layout.addView(permission);
+                  permission = new CheckBox(this); permission.setText("Tôi có quyền lưu các ảnh này"); layout.addView(permission);
                   preview = new ImageView(this); preview.setAdjustViewBounds(true); preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
                   layout.addView(preview, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+                  LinearLayout nav = new LinearLayout(this); nav.setOrientation(LinearLayout.HORIZONTAL);
+                  prev = new Button(this); prev.setText("Ảnh trước"); nav.addView(prev,new LinearLayout.LayoutParams(0,dp(52),1));
+                  next = new Button(this); next.setText("Ảnh sau"); nav.addView(next,new LinearLayout.LayoutParams(0,dp(52),1)); layout.addView(nav);
+                  position = new TextView(this); layout.addView(position);
                   status = new TextView(this); status.setText("Chưa có ảnh. Không hỗ trợ bài riêng tư hoặc yêu cầu đăng nhập."); layout.addView(status);
                   save = new Button(this); save.setText("Lưu ảnh vào điện thoại"); save.setEnabled(false); layout.addView(save);
+                  all = new Button(this); all.setText("Lưu tất cả ảnh tìm thấy"); all.setEnabled(false); layout.addView(all);
                   Button back = new Button(this); back.setText("Quay lại Douyin"); layout.addView(back); back.setOnClickListener(v -> finish());
-                  permission.setOnCheckedChangeListener((v, checked) -> save.setEnabled(checked && image != null && analyze.isEnabled()));
+                  permission.setOnCheckedChangeListener((v, checked) -> refreshButtons());
+                  prev.setOnClickListener(v -> showPhoto(index-1)); next.setOnClickListener(v -> showPhoto(index+1));
+                  all.setOnClickListener(v -> saveAll());
                   analyze.setOnClickListener(v -> loadImage());
                   save.setOnClickListener(v -> saveImage());
+                  refreshButtons();
               }
-              private void busy(boolean value) { analyze.setEnabled(!value); paste.setEnabled(!value); input.setEnabled(!value); save.setEnabled(!value && permission.isChecked() && image != null); }
+              private void refreshButtons() {
+                  boolean idle=analyze.isEnabled(); boolean canSave=idle && permission.isChecked() && !previewOnly;
+                  prev.setEnabled(idle && index>0 && !photos.isEmpty()); next.setEnabled(idle && index+1<photos.size());
+                  save.setEnabled(canSave && image!=null);
+                  all.setEnabled(canSave && Build.VERSION.SDK_INT>=29 && photos.size()>1);
+                  if(Build.VERSION.SDK_INT<29)all.setText("Android 8–9: lưu từng ảnh");
+                  position.setText(photos.isEmpty()?"":("Ảnh "+(index+1)+" / "+photos.size()+" · "+albumSummary));
+              }
+              private void busy(boolean value) { analyze.setEnabled(!value); paste.setEnabled(!value); input.setEnabled(!value); refreshButtons(); }
               private void loadImage() {
                   String text = input.getText().toString();
-                  image = null; mime = null; filename = null; preview.setImageDrawable(null); permission.setChecked(false);
-                  busy(true); status.setText("Đang kiểm tra nguồn ảnh công khai...");
+                  image=null; mime=null; filename=null; photos=Collections.emptyList(); index=0; previewOnly=false; albumSummary="";
+                  preview.setImageDrawable(null); permission.setChecked(false);
+                  busy(true); status.setText("Đang phân tích bài đăng công khai...");
                   executor.execute(() -> {
                       try {
-                          URI url = InstagramPublicImage.extract(text);
-                          boolean post = InstagramPublicImage.isPost(url);
-                          if (post) {
-                              Data page = fetch(url, MAX_HTML, true);
-                              if (!page.mime.equals("text/html") && !page.mime.equals("application/xhtml+xml")) throw new IOException("Trang không trả về HTML.");
-                              url = InstagramPublicImage.previewUrl(new String(page.bytes, StandardCharsets.UTF_8));
-                              if (url == null) throw new IOException("Không tìm thấy ảnh xem trước công khai. Có thể Instagram yêu cầu đăng nhập hoặc không cung cấp ảnh.");
-                          }
-                          Data result = fetch(url, MAX_IMAGE, false);
-                          String ext;
-                          switch(result.mime) {
-                              case "image/jpeg": ext = "jpg"; break;
-                              case "image/png": ext = "png"; break;
-                              case "image/webp": ext = "webp"; break;
-                              case "image/gif": ext = "gif"; break;
-                              default: throw new IOException("Nguồn không trả về tệp ảnh được hỗ trợ.");
-                          }
-                          BitmapFactory.Options dimensions = new BitmapFactory.Options(); dimensions.inJustDecodeBounds = true;
-                          BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.length, dimensions);
-                          if (dimensions.outWidth <= 0 || dimensions.outHeight <= 0) throw new IOException("Tệp ảnh không hợp lệ.");
-                          BitmapFactory.Options options = new BitmapFactory.Options(); options.inSampleSize = 1;
-                          while (Math.max(dimensions.outWidth, dimensions.outHeight) / options.inSampleSize > 1800) options.inSampleSize *= 2;
-                          Bitmap bitmap = BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.length, options);
-                          if (bitmap == null) throw new IOException("Không đọc được ảnh.");
-                          runOnUiThread(() -> {
-                              if (isFinishing() || isDestroyed()) { bitmap.recycle(); return; }
-                              image = result.bytes; mime = result.mime; filename = "Instagram_" + System.currentTimeMillis() + "." + ext;
-                              preview.setImageBitmap(bitmap);
-                              status.setText((post ? "Ảnh xem trước công khai (có thể không phải ảnh gốc)" : "Ảnh trực tiếp") + " · " + dimensions.outWidth + " × " + dimensions.outHeight);
-                              busy(false);
-                          });
-                      } catch (Exception ex) { showError(ex); }
+                          URI url=InstagramPublicImage.extract(text);
+                          List<InstagramAlbum.Photo> found;
+                          String summary; boolean onlyPreview=false;
+                          if(InstagramPublicImage.isPost(url)) {
+                              Data page=fetch(url,MAX_HTML,true);
+                              String html=new String(page.bytes,StandardCharsets.UTF_8);
+                              String code=url.getPath().split("/")[2];
+                              InstagramAlbum.Result result=InstagramAlbum.parse(html,code);
+                              found=result.photos;
+                              if(found.isEmpty()) {
+                                  URI thumb=InstagramPublicImage.previewUrl(html);
+                                  if(thumb==null) throw new IOException("Instagram không cung cấp dữ liệu ảnh công khai. Không hỗ trợ vượt giới hạn truy cập.");
+                                  found=Collections.singletonList(new InstagramAlbum.Photo(thumb,0,0));
+                                  onlyPreview=true;
+                                  summary="Chỉ có ảnh đại diện; không lưu như ảnh chất lượng cao.";
+                              } else {
+                                  summary=result.carousel ? ("Album: "+found.size()+" ảnh; "+result.itemsFound+" mục nhận diện"+(result.expected>result.itemsFound?" / "+result.expected+" mục dự kiến (chưa đủ)":"")+". Bỏ qua video.") : "Ảnh bài đăng";
+                              }
+                          } else { found=Collections.singletonList(new InstagramAlbum.Photo(url,0,0)); summary="URL ảnh trực tiếp"; }
+                          final List<InstagramAlbum.Photo> ready=found; final String detail=summary; final boolean fallback=onlyPreview;
+                          runOnUiThread(() -> { if(isFinishing()||isDestroyed())return; photos=ready; albumSummary=detail; previewOnly=fallback; showPhoto(0); });
+                      } catch(Exception ex) { showError(ex); }
                   });
+              }
+              private static String extension(String mime) throws IOException {
+                  switch(mime){case "image/jpeg":return "jpg";case "image/png":return "png";case "image/webp":return "webp";case "image/gif":return "gif";default:throw new IOException("Định dạng ảnh chưa hỗ trợ.");}
+              }
+              private static BitmapFactory.Options dimensions(Data data) throws IOException {
+                  extension(data.mime);
+                  BitmapFactory.Options d=new BitmapFactory.Options(); d.inJustDecodeBounds=true;
+                  BitmapFactory.decodeByteArray(data.bytes,0,data.bytes.length,d);
+                  if(d.outWidth<=0||d.outHeight<=0)throw new IOException("Tệp ảnh không hợp lệ."); return d;
+              }
+              private void showPhoto(int target) {
+                  if(target<0||target>=photos.size())return;
+                  index=target; image=null; mime=null; filename=null; preview.setImageDrawable(null); busy(true);
+                  status.setText("Đang tải ảnh "+(index+1)+"...");
+                  InstagramAlbum.Photo photo=photos.get(target);
+                  executor.execute(() -> {
+                      try {
+                          Data data=fetch(photo.url,MAX_IMAGE,false); BitmapFactory.Options d=dimensions(data);
+                          BitmapFactory.Options opt=new BitmapFactory.Options(); opt.inSampleSize=1;
+                          while(Math.max(d.outWidth,d.outHeight)/opt.inSampleSize>1800)opt.inSampleSize*=2;
+                          Bitmap bitmap=BitmapFactory.decodeByteArray(data.bytes,0,data.bytes.length,opt);
+                          if(bitmap==null)throw new IOException("Không đọc được ảnh.");
+                          String name="Instagram_"+System.currentTimeMillis()+"_"+(target+1)+"."+extension(data.mime);
+                          runOnUiThread(() -> {
+                              if(isFinishing()||isDestroyed()){bitmap.recycle();return;}
+                              image=data.bytes; mime=data.mime; filename=name; preview.setImageBitmap(bitmap);
+                              status.setText((previewOnly?"Chỉ ảnh đại diện – không lưu":"Tệp ảnh được cung cấp, không nén lại")+" · "+d.outWidth+" × "+d.outHeight+" px"+(photo.width>0&&photo.height>0&&(d.outWidth<photo.width||d.outHeight<photo.height)?" (thấp hơn kích thước khai báo)":"")); busy(false);
+                          });
+                      }catch(Exception ex){showError(ex);}
+                  });
+              }
+              private void saveAll(){
+                  if(Build.VERSION.SDK_INT<29||previewOnly||!permission.isChecked()||photos.size()<2)return;
+                  final List<InstagramAlbum.Photo> batch=new ArrayList<>(photos); final long stamp=System.currentTimeMillis();
+                  final int selected=index; final byte[] cached=image; final String cachedMime=mime;
+                  busy(true);
+                  executor.execute(() -> {
+                      int ok=0; int failed=0;
+                      for(int k=0;k<batch.size()&&!Thread.currentThread().isInterrupted();k++){
+                          final int progress=k+1;
+                          runOnUiThread(() -> {if(!isFinishing()&&!isDestroyed())status.setText("Đang lưu "+progress+" / "+batch.size());});
+                          try{
+                              Data data=(k==selected&&cached!=null)?new Data(cached,cachedMime):fetch(batch.get(k).url,MAX_IMAGE,false);
+                              dimensions(data); saveToGallery(data.bytes,data.mime,"Instagram_"+stamp+"_"+(k+1)+"."+extension(data.mime)); ok++;
+                          }catch(Exception ex){failed++;}
+                      }
+                      final int saved=ok,errors=failed;
+                      runOnUiThread(() -> {if(!isFinishing()&&!isDestroyed()){status.setText("Đã lưu "+saved+" / "+batch.size()+" ảnh vào Pictures/DouyinInstagram. Lỗi: "+errors);busy(false);}});
+                  });
+              }
+              private void saveToGallery(byte[] data,String type,String name) throws Exception {
+                  Uri uri=null;
+                  try {
+                      ContentValues values=new ContentValues(); values.put(MediaStore.Images.Media.DISPLAY_NAME,name); values.put(MediaStore.Images.Media.MIME_TYPE,type);
+                      values.put(MediaStore.Images.Media.RELATIVE_PATH,"Pictures/DouyinInstagram"); values.put(MediaStore.Images.Media.IS_PENDING,1);
+                      uri=getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,values);
+                      if(uri==null)throw new IOException("Không tạo được tệp."); write(uri,data);
+                      values.clear();values.put(MediaStore.Images.Media.IS_PENDING,0);getContentResolver().update(uri,values,null,null);
+                  }catch(Exception ex){if(uri!=null)try{getContentResolver().delete(uri,null,null);}catch(Exception ignored){}throw ex;}
               }
               private void showError(Exception ex) {
                   runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) { status.setText("Không thành công: " + (ex.getMessage() == null ? "Lỗi kết nối hoặc dữ liệu" : ex.getMessage())); busy(false); } });
@@ -264,7 +335,7 @@ jobs:
                       try {
                           connection.setInstanceFollowRedirects(false); connection.setConnectTimeout(15000); connection.setReadTimeout(20000);
                           connection.setRequestProperty("Accept", page ? "text/html,application/xhtml+xml" : "image/*");
-                          connection.setRequestProperty("User-Agent", "InstagramImageViewer/1.0");
+                          connection.setRequestProperty("User-Agent", "InstagramImageViewer/1.1");
                           int code = connection.getResponseCode();
                           if (code >= 300 && code < 400) {
                               String location = connection.getHeaderField("Location");
@@ -286,7 +357,7 @@ jobs:
                   throw new IOException("Quá nhiều chuyển hướng.");
               }
               private void saveImage() {
-                  if (image == null || !permission.isChecked()) return;
+                  if (image == null || previewOnly || !permission.isChecked()) return;
                   if (Build.VERSION.SDK_INT < 29) {
                       Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType(mime).addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE, filename);
                       startActivityForResult(intent, PICK_FILE); return;
@@ -311,7 +382,7 @@ jobs:
               }
               @Override protected void onActivityResult(int request, int result, Intent data) {
                   super.onActivityResult(request, result, data);
-                  if (request != PICK_FILE || result != RESULT_OK || data == null || data.getData() == null || image == null || !permission.isChecked()) return;
+                  if (request != PICK_FILE || result != RESULT_OK || data == null || data.getData() == null || image == null || previewOnly || !permission.isChecked()) return;
                   final Uri uri = data.getData(); final byte[] bytes = image; busy(true);
                   executor.execute(() -> { try { write(uri, bytes); runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) { status.setText("Đã lưu ảnh."); busy(false); } }); } catch (Exception ex) { showError(ex); } });
               }
@@ -366,6 +437,134 @@ jobs:
               }
           }
           JAVA
+          cat > app/src/main/java/com/douyin/downloader/InstagramAlbum.java <<'JAVA'
+          package com.douyin.downloader;
+          
+          import java.net.URI;
+          import java.util.*;
+          import java.util.regex.*;
+          
+          /** Reads only JSON already included in a publicly accessible post's HTML. */
+          final class InstagramAlbum {
+              static final class Photo {
+                  final URI url; final int width, height;
+                  Photo(URI u, int w, int h) { url=u; width=w; height=h; }
+                  long area() { return (long)width*height; }
+              }
+              static final class Result {
+                  final List<Photo> photos; final int expected, itemsFound; final boolean carousel;
+                  Result(List<Photo> p,int e,int f,boolean c){photos=p;expected=e;itemsFound=f;carousel=c;}
+              }
+              private static final Pattern SCRIPT=Pattern.compile("<script\\b([^>]*)>(.*?)</script\\s*>", Pattern.CASE_INSENSITIVE|Pattern.DOTALL);
+              private static final Pattern JSON_TYPE=Pattern.compile("\\btype\\s*=\\s*(?:\"application/(?:ld\\+)?json\"|'application/(?:ld\\+)?json'|application/(?:ld\\+)?json(?=\\s|$))",Pattern.CASE_INSENSITIVE);
+              static Result parse(String html,String code) {
+                  Result best=new Result(Collections.emptyList(),0,0,false);
+                  Matcher m=SCRIPT.matcher(html);
+                  int scripts=0;
+                  while(m.find() && ++scripts<=2000) {
+                      String body=m.group(2).trim();
+                      if(!JSON_TYPE.matcher(m.group(1)).find()) {
+                          if(!body.startsWith("window._sharedData")) continue;
+                          int i=body.indexOf('='); if(i<0) continue;
+                          body=body.substring(i+1).trim(); if(body.endsWith(";")) body=body.substring(0,body.length()-1);
+                      }
+                      try { best=walk(new Json(body).parse(),code,best,0); } catch(IllegalArgumentException ignored){}
+                  }
+                  return best;
+              }
+              private static Result walk(Object o,String code,Result best,int depth){
+                  if(depth>100) return best;
+                  if(o instanceof Map){
+                      Map<?,?> m=(Map<?,?>)o;
+                      if(code.equals(str(m.get("shortcode")))||code.equals(str(m.get("code")))) {
+                          Result r=read(m);
+                          if(r!=null && better(r,best)) best=r;
+                      }
+                      for(Object v:m.values()) if(v instanceof Map||v instanceof List) best=walk(v,code,best,depth+1);
+                  } else if(o instanceof List) for(Object v:(List<?>)o) if(v instanceof Map||v instanceof List) best=walk(v,code,best,depth+1);
+                  return best;
+              }
+              private static boolean better(Result a,Result b){
+                  if(a.carousel!=b.carousel) return a.carousel;
+                  if(a.photos.size()!=b.photos.size()) return a.photos.size()>b.photos.size();
+                  if(a.itemsFound!=b.itemsFound) return a.itemsFound>b.itemsFound;
+                  long x=0,y=0; for(Photo p:a.photos)x+=p.area(); for(Photo p:b.photos)y+=p.area();
+                  return x>y;
+              }
+              private static Result read(Map<?,?> m){
+                  if(Boolean.TRUE.equals(m.get("is_private"))||Boolean.TRUE.equals(map(m.get("owner")).get("is_private"))||Boolean.TRUE.equals(map(m.get("user")).get("is_private"))) return null;
+                  Map<?,?> edge=map(m.get("edge_sidecar_to_children"));
+                  List<?> children=list(m.get("carousel_media")); boolean modern=m.get("carousel_media") instanceof List;
+                  if(!modern) children=list(edge.get("edges"));
+                  boolean carousel=modern||m.get("edge_sidecar_to_children") instanceof Map||num(m.get("media_type"))==8||"GraphSidecar".equals(str(m.get("__typename")));
+                  List<Photo> photos=new ArrayList<>(); Set<URI> seen=new HashSet<>();
+                  if(carousel){
+                      for(Object raw:children){
+                          Map<?,?> child=map(raw); if(!modern)child=map(child.get("node"));
+                          Photo p=photo(child); if(p!=null&&seen.add(p.url))photos.add(p);
+                      }
+                      int expected=Math.max(Math.max(num(m.get("carousel_media_count")),num(edge.get("count"))),children.size());
+                      return new Result(photos,expected,children.size(),true);
+                  }
+                  Photo p=photo(m); if(p==null)return null;
+                  photos.add(p); return new Result(photos,1,1,false);
+              }
+              private static Photo photo(Map<?,?> m){
+                  if(Boolean.TRUE.equals(m.get("is_video"))||num(m.get("media_type"))==2||"GraphVideo".equals(str(m.get("__typename")))||m.get("video_versions") instanceof List) return null;
+                  Photo best=null;
+                  for(Object c:list(map(m.get("image_versions2")).get("candidates"))){
+                      Map<?,?> d=map(c); best=pick(best, d.get("url"),num(d.get("width")),num(d.get("height")));
+                  }
+                  for(Object c:list(m.get("display_resources"))){
+                      Map<?,?> d=map(c); best=pick(best,d.get("src"),num(d.get("config_width")),num(d.get("config_height")));
+                  }
+                  Map<?,?> dims=map(m.get("dimensions"));
+                  best=pick(best,m.get("display_url"),num(dims.get("width")),num(dims.get("height")));
+                  best=pick(best,m.get("display_src"),num(dims.get("width")),num(dims.get("height")));
+                  return best;
+              }
+              private static Photo pick(Photo best,Object raw,int w,int h){
+                  if(!(raw instanceof String))return best;
+                  try { URI u=URI.create((String)raw); if(!InstagramPublicImage.isImageHost(u))return best;
+                      Photo p=new Photo(u,w,h); return best==null||p.area()>best.area()?p:best;
+                  }catch(IllegalArgumentException ex){return best;}
+              }
+              private static Map<?,?> map(Object x){return x instanceof Map?(Map<?,?>)x:Collections.emptyMap();}
+              private static List<?> list(Object x){return x instanceof List?(List<?>)x:Collections.emptyList();}
+              private static String str(Object x){return x instanceof String?(String)x:"";}
+              private static int num(Object x){if(!(x instanceof Number))return 0; long n=((Number)x).longValue(); return n>0&&n<=1000000?(int)n:0;}
+              // Small strict JSON reader, so the parser can be tested with ordinary javac.
+              private static final class Json {
+                  final String s; int i; Json(String s){this.s=s;}
+                  Object parse(){Object v=value(0); ws(); if(i!=s.length())bad(); return v;}
+                  void ws(){while(i<s.length()&&Character.isWhitespace(s.charAt(i)))i++;}
+                  boolean eat(char c){ws(); if(i<s.length()&&s.charAt(i)==c){i++;return true;}return false;}
+                  void need(char c){if(!eat(c))bad();}
+                  void bad(){throw new IllegalArgumentException("Invalid JSON");}
+                  Object value(int depth){
+                      ws(); if(depth>120||i>=s.length())bad(); char c=s.charAt(i);
+                      if(c=='{'){i++;Map<String,Object> m=new LinkedHashMap<>();if(eat('}'))return m;do{ws();String k=string();need(':');m.put(k,value(depth+1));}while(eat(','));need('}');return m;}
+                      if(c=='['){i++;List<Object> a=new ArrayList<>();if(eat(']'))return a;do{a.add(value(depth+1));}while(eat(','));need(']');return a;}
+                      if(c=='"')return string();
+                      if(s.startsWith("true",i)){i+=4;return true;}if(s.startsWith("false",i)){i+=5;return false;}if(s.startsWith("null",i)){i+=4;return null;}
+                      int start=i; if(c=='-')i++;
+                      while(i<s.length()&&Character.isDigit(s.charAt(i)))i++;
+                      if(i<s.length()&&s.charAt(i)=='.'){i++;while(i<s.length()&&Character.isDigit(s.charAt(i)))i++;}
+                      if(i<s.length()&&(s.charAt(i)=='e'||s.charAt(i)=='E')){i++;if(i<s.length()&&(s.charAt(i)=='+'||s.charAt(i)=='-'))i++;while(i<s.length()&&Character.isDigit(s.charAt(i)))i++;}
+                      if(start==i)bad(); return Double.valueOf(s.substring(start,i));
+                  }
+                  String string(){
+                      if(i>=s.length()||s.charAt(i++)!='"')bad();StringBuilder b=new StringBuilder();
+                      while(i<s.length()){
+                          char c=s.charAt(i++);if(c=='"')return b.toString();if(c<32)bad();
+                          if(c!='\\'){b.append(c);continue;}if(i>=s.length())bad();c=s.charAt(i++);
+                          switch(c){case '"':case '\\':case '/':b.append(c);break;case 'b':b.append('\b');break;case 'f':b.append('\f');break;case 'n':b.append('\n');break;case 'r':b.append('\r');break;case 't':b.append('\t');break;case 'u':if(i+4>s.length())bad();b.append((char)Integer.parseInt(s.substring(i,i+4),16));i+=4;break;default:bad();}
+                      }
+                      bad();return "";
+                  }
+              }
+          }
+          JAVA
           mkdir -p /tmp/instagram-v5-test
           cat > /tmp/instagram-v5-test/TestPublicImage.java <<'JAVA'
           package com.douyin.downloader;
@@ -388,8 +587,34 @@ jobs:
               }
           }
           JAVA
-          javac -d /tmp/instagram-v5-test app/src/main/java/com/douyin/downloader/InstagramPublicImage.java /tmp/instagram-v5-test/TestPublicImage.java
+          cat > /tmp/instagram-v5-test/TestAlbum.java <<'JAVA'
+          package com.douyin.downloader;
+          class TestAlbum {
+              static int count;
+              static void check(boolean b){if(!b)throw new AssertionError("Test "+(count+1));count++;}
+              static String html(String s){return "<script type=\"application/json\">"+s+"</script>";}
+              static String candidate(String name,int w,int h){return "{\"url\":\"https://scontent.cdninstagram.com/"+name+".jpg\",\"width\":"+w+",\"height\":"+h+"}";}
+              static String item(String name){return "{\"media_type\":1,\"image_versions2\":{\"candidates\":["+candidate(name+"-small",320,320)+","+candidate(name+"-large",1080,1350)+"]}}";}
+              public static void main(String[] args){
+                  InstagramAlbum.Result a=InstagramAlbum.parse(html("{\"code\":\"Abc\",\"media_type\":8,\"carousel_media_count\":3,\"carousel_media\":["+item("first")+",{"+"\"media_type\":2},"+item("third")+"]}"),"Abc");
+                  check(a.carousel);check(a.photos.size()==2);check(a.expected==3);check(a.itemsFound==3);check(a.photos.get(0).url.toString().endsWith("first-large.jpg"));check(a.photos.get(1).url.toString().endsWith("third-large.jpg"));check(a.photos.get(0).width==1080);
+                  String legacy="{\"shortcode\":\"Abc\",\"edge_sidecar_to_children\":{\"count\":2,\"edges\":[{\"node\":{\"display_url\":\"https://scontent.cdninstagram.com/one.jpg\",\"dimensions\":{\"width\":1080,\"height\":1080}}},{\"node\":{\"display_url\":\"https://scontent.cdninstagram.com/two.jpg\"}}]}}";
+                  a=InstagramAlbum.parse(html(legacy),"Abc");check(a.photos.size()==2);check(a.expected==2);
+                  check(InstagramAlbum.parse(html(legacy),"Different").photos.isEmpty());
+                  check(InstagramAlbum.parse("<meta property='og:image' content='https://scontent.cdninstagram.com/p.jpg'>","Abc").photos.isEmpty());
+                  check(InstagramAlbum.parse(html("{\"code\":\"Abc\",\"user\":{\"is_private\":true},\"display_url\":\"https://scontent.cdninstagram.com/one.jpg\"}"),"Abc").photos.isEmpty());
+                  check(InstagramAlbum.parse(html("{\"code\":\"Abc\",\"display_url\":\"https://evil.example/a.jpg\"}"),"Abc").photos.isEmpty());
+                  check(InstagramAlbum.parse(html("invalid")+html(legacy),"Abc").photos.size()==2);
+                  check(InstagramAlbum.parse("<script>window._sharedData = "+legacy+";</script>","Abc").photos.size()==2);
+                  a=InstagramAlbum.parse(html("{\"code\":\"Abc\",\"carousel_media_count\":3,\"carousel_media\":["+item("one")+"]}"),"Abc");check(a.expected==3&&a.itemsFound==1);
+                  a=InstagramAlbum.parse(html("{\"code\":\"Abc\",\"display_resources\":[{\"src\":\"https://scontent.cdninstagram.com/small.jpg\",\"config_width\":320,\"config_height\":320},{\"src\":\"https://scontent.cdninstagram.com/large.jpg\",\"config_width\":1080,\"config_height\":1350}]}"),"Abc");check(a.photos.size()==1&&a.photos.get(0).width==1080);
+                  System.out.println(count+" album tests passed");
+              }
+          }
+          JAVA
+          javac -d /tmp/instagram-v5-test app/src/main/java/com/douyin/downloader/InstagramPublicImage.java app/src/main/java/com/douyin/downloader/InstagramAlbum.java /tmp/instagram-v5-test/TestPublicImage.java /tmp/instagram-v5-test/TestAlbum.java
           java -cp /tmp/instagram-v5-test com.douyin.downloader.TestPublicImage
+          java -cp /tmp/instagram-v5-test com.douyin.downloader.TestAlbum
 
       - name: Build APK
         working-directory: qingzai
@@ -400,14 +625,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp qingzai/app/build/outputs/apk/debug/app-debug.apk dist/DouyinInstagram-V5-VN.apk
+          cp qingzai/app/build/outputs/apk/debug/app-debug.apk dist/DouyinInstagram-V5.1-VN.apk
           cp qingzai/LICENSE dist/LICENSE-QingZai.txt
           git -C qingzai rev-parse HEAD > dist/UPSTREAM-COMMIT.txt
-          sha256sum dist/DouyinInstagram-V5-VN.apk > dist/SHA256.txt
+          sha256sum dist/DouyinInstagram-V5.1-VN.apk > dist/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DouyinInstagram-V5-VN
+          name: DouyinInstagram-V5.1-VN
           path: dist/
           if-no-files-found: error
